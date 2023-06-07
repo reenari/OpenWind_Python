@@ -2,6 +2,8 @@ import argparse
 import socket
 import time
 import asyncio
+from datetime import datetime
+
 from bleak import BleakClient, BleakGATTCharacteristic
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
@@ -20,6 +22,9 @@ args = {}
 
 monotonic_wind = time.monotonic_ns()
 monotonic_motion = time.monotonic_ns()
+watchdog = 0
+
+global stop_event
 
 
 def socket(msg):
@@ -76,7 +81,7 @@ def bat_data(data):
     temp = float(get_signed_int16(data[8], data[9]))
     total = float((data[10] << 8) | data[11])
 
-    print(f"soc: {soc:3.1f}% con: {consumption:3.1f}mA remain: {remain:3.1f}mAh vols: {volts:3.1f}mV temp: {temp:3.1f}C"
+    print(f"{datetime.now()} soc: {soc:3.1f}% con: {consumption:3.1f}mA remain: {remain:3.1f}mAh vols: {volts:3.1f}mV temp: {temp:3.1f}C"
           f" total: {total:3.1f}mAh")
 
 
@@ -86,17 +91,21 @@ def wind_data_callback(sender: BleakGATTCharacteristic, data: bytearray):
     global monotonic_motion
     global wind_rate
     global motion_rate
+    global args
+    global watchdog
 
     new_monotonic = time.monotonic_ns()
     wind_ts_diff = new_monotonic - monotonic_wind
     motion_ts_diff = new_monotonic - monotonic_motion
+    watchdog = 0
 
-    if wind_ts_diff > wind_rate:
+    if wind_ts_diff > args.wind_rate * 1000 * 1000:
         monotonic_wind = new_monotonic
         AWA = float((data[2] << 8) | data[1]) * 0.1  # °
         AWS = float((data[4] << 8) | data[3]) * 0.01  # kts
 
-        print("AWA: " + "{:3.1f}".format(AWA) + " AWS: " + "{:3.1f}".format(AWS))
+        if not args.quiet:
+            print("AWA: " + "{:3.1f}".format(AWA) + " AWS: " + "{:3.1f}".format(AWS))
 
         NMEA0183_WIND_Sentece = "$WIMWV," + "{:3.1f}".format(AWA) + ",R," + "{:3.1f}".format(AWS) + ",N,A*"
         cs = str(checksum(NMEA0183_WIND_Sentece))
@@ -105,7 +114,7 @@ def wind_data_callback(sender: BleakGATTCharacteristic, data: bytearray):
         socket(NMEA0183_WIND_Sentece)
 
     # Only if Firmware Version is same or above 1.25
-    if float(fw_number) >= 1.25 and motion_ts_diff > motion_rate:
+    if float(fw_number) >= 1.25 and motion_ts_diff > args.motion_rate * 1000 * 1000:
         monotonic_motion = new_monotonic
         YAW = float((data[6] << 8) | data[5]) * 1 / 16 - 90  # °
         PITCH = float(get_signed_int16(data[8], data[7])) * 1 / 16  # ° # Pitch and roll swapped in 1.34
@@ -116,7 +125,8 @@ def wind_data_callback(sender: BleakGATTCharacteristic, data: bytearray):
         acc_calib = (data[11] & 0b00001100) >> 2
         gyro_calib = (data[11] & 0b00110000) >> 4
         # print("C: " + hex(CALIBRATE_STATUS) + " " + bin(CALIBRATE_STATUS))
-        # print("CALIB: mag: "+ str(mag_calib) + " acc: " + str(acc_calib) + " gyro: " + str(gyro_calib))
+        if not args.quiet:
+            print("CALIB: mag: " + str(mag_calib) + " acc: " + str(acc_calib) + " gyro: " + str(gyro_calib))
 
         if YAW < 0:
             YAW = 360 + YAW
@@ -124,7 +134,8 @@ def wind_data_callback(sender: BleakGATTCharacteristic, data: bytearray):
         if ROLL >= 180:
             ROLL = ROLL - 360
 
-        print("YAW: {:3.1f} PITCH: {:3.1f} ROLL: {:3.1f}".format(YAW, PITCH, ROLL))
+        if not args.quiet:
+            print("YAW: {:3.1f} PITCH: {:3.1f} ROLL: {:3.1f}".format(YAW, PITCH, ROLL))
 
         NMEA0183_HEADING_Sentece = "$WIHDM," + "{:3.1f}".format(YAW) + ",M*"
         cs = str(checksum(NMEA0183_HEADING_Sentece))
@@ -144,6 +155,7 @@ def simple_callback(device: BLEDevice, advertisement_data: AdvertisementData):
 
 
 def ow_disconnect_callback(client):
+    global stop_event
     global deviceConnected
     deviceConnected = False
     print("OpenWind with address {} got disconnected!".format(client.address))
@@ -159,6 +171,8 @@ async def run():
     global deviceConnected
     global fw_number
     global args
+    global watchdog
+    global stop_event
 
     if args.device is None:
         print("looking for device")
@@ -177,57 +191,85 @@ async def run():
 
     stop_event = asyncio.Event()
 
-    async with BleakClient(device, ow_disconnect_callback) as client:
-        deviceConnected = True
-        svcs = client.services
-        print("Services:")
-        for service in svcs:
-            print(service)
-        fw_number = await client.read_gatt_char(OPENWIND_FW_CHARACTERISTIC_UUID)
-        print("Model Number: {0}".format("".join(map(chr, fw_number))))
+    try:
+        async with BleakClient(device, ow_disconnect_callback) as client:
+            deviceConnected = True
+            svcs = client.services
+            print("Services:")
+            for service in svcs:
+                print(service)
+            fw_number = await client.read_gatt_char(OPENWIND_FW_CHARACTERISTIC_UUID)
+            print("Model Number: {0}".format("".join(map(chr, fw_number))))
 
-        sn_number = await client.read_gatt_char(OPENWIND_SN_CHARACTERISTIC_UUID)
+            sn_number = await client.read_gatt_char(OPENWIND_SN_CHARACTERISTIC_UUID)
 
-        if float(fw_number) >= 1.27:
-            print("Serial Number: {0}".format(sn_number.hex()))
-        else:
-            print("Serial Number: {0}".format("".join(map(chr, sn_number))))
+            if float(fw_number) >= 1.27:
+                print("Serial Number: {0}".format(sn_number.hex()))
+            else:
+                print("Serial Number: {0}".format("".join(map(chr, sn_number))))
 
-        write_value = bytearray([0x2C])
-        await client.write_gatt_char(OPENWIND_MOV_ENABLE_CHARACTERISTIC_UUID, write_value)
-        await asyncio.sleep(1.0)
-        await client.start_notify(OPENWIND_WIND_CHARACTERISTIC_UUID, wind_data_callback)
+            write_value = bytearray([0x2C])
+            await client.write_gatt_char(OPENWIND_MOV_ENABLE_CHARACTERISTIC_UUID, write_value)
+            await asyncio.sleep(1.0)
+            await client.start_notify(OPENWIND_WIND_CHARACTERISTIC_UUID, wind_data_callback)
 
-        batt_info = await client.read_gatt_char(OPENWIND_BAT_CHARACTERISTIC_UUID)
-        bat_data(batt_info)
-        #        await stop_event.wait()
-        while client.is_connected:
-            await asyncio.sleep(10.0)
-            batt_info = await client.read_gatt_char(OPENWIND_BAT_CHARACTERISTIC_UUID)
-            bat_data(batt_info)
+            watchdog = 0
+            while client.is_connected:
+                batt_info = await client.read_gatt_char(OPENWIND_BAT_CHARACTERISTIC_UUID)
+                bat_data(batt_info)
+                await asyncio.sleep(args.batt_rate)
+                watchdog += 1
+                if watchdog > 3:
+                    break
+
+            print("client disconnect")
+
+    except:
+        pass
 
 
 async def scanner():
     global args
+    devices = {}
 
-    def callback(device: BLEDevice, advertising_data: AdvertisementData):
+    async def callback(device: BLEDevice, advertising_data: AdvertisementData):
         if advertising_data.local_name == 'OpenWind':
-            print("Found OpenWind device address={}".format(device.address))
+            devices[device.address] = device
+            print(f"Found OpenWind device address={device.address}")
 
     async with BleakScanner(callback) as scanner:
         await asyncio.sleep(args.scan_time)
+        await scanner.stop()
+
+    for device in devices.keys():
+        print(device)
+        try:
+            async with BleakClient(devices[device], None, timeout=3.0) as client:
+                print(f"client: {client.address} name {devices[device].name} RSSI {devices[device].rssi}")
+                fw_number = await client.read_gatt_char(OPENWIND_FW_CHARACTERISTIC_UUID)
+                print("Version Number: {0}".format("".join(map(chr, fw_number))))
+                await client.disconnect()
+            print(".")
+        except:
+            print(",")
+            pass
+        await asyncio.sleep(1)
 
 
 def main():
     global args
     parser = argparse.ArgumentParser(prog="OpenWindRelay",
                                      description="Connects to Openwind and relays wind and heading NMEA data to udp socket")
-    parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('-v', '--verbose', default=False, action='store_true')
+    parser.add_argument('-q', '--quiet', default=False, action='store_true')
+    parser.add_argument('-r', '--reconnect', default=False, action='store_true')
     parser.add_argument('-w', '--wind_rate', type=int, default=500, action='store',
                         help='minimum time between NMEA wind sentences in ms')
     parser.add_argument('-m', '--motion_rate', type=int, default=1000, action='store',
                         help='minimum time between NMEA heading sentences in ms')
-    parser.add_argument('-b', '--batt_rate', type=int, action='store',
+    parser.add_argument('-p', '--switch_pitch', action='store_true',
+                        help='switch pitch and roll value (firmware dependent')
+    parser.add_argument('-b', '--batt_rate', type=int, default=10, action='store',
                         help='time between printing battery info to stdout in seconds')
     parser.add_argument('-c', '--batt_cutoff', type=int, default=10, action='store',
                         help='battery %% to shutoff')
@@ -242,7 +284,17 @@ def main():
     if args.list_devices:
         asyncio.run(scanner())
     else:
-        asyncio.run(run())
+        while True:
+            try:
+                asyncio.run(run())
+            except KeyboardInterrupt as ki:
+                print("shutting down")
+                break
+            except Exception as e:
+                print(f"EX: {e}")
+                pass
+            if not args.reconnect:
+                break
 
     # while True:
     #     try:
