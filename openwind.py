@@ -192,6 +192,7 @@ async def run():
     stop_event = asyncio.Event()
 
     try:
+        print(f"trying to connect {device}")
         async with BleakClient(device, ow_disconnect_callback) as client:
             deviceConnected = True
             svcs = client.services
@@ -215,18 +216,38 @@ async def run():
 
             watchdog = 0
             while client.is_connected:
-                batt_info = await client.read_gatt_char(OPENWIND_BAT_CHARACTERISTIC_UUID)
-                bat_data(batt_info)
+                # try:
+                #     async with asyncio.timeout(args.batt_rate):  # New in python version 3.11
+                #         batt_info = await client.read_gatt_char(OPENWIND_BAT_CHARACTERISTIC_UUID)
+                #         bat_data(batt_info)
+                # except TimeoutError:
+                #     print("Timeout while waiting batt data")
+                #     watchdog = 3
+                # except Exception as e:
+                #     print(f"got {e}")
+                try:
+                    await asyncio.wait_for(get_batt_data(client), timeout=args.batt_rate)
+                except asyncio.TimeoutError:
+                    print("Timeout while waiting batt data")
+                    watchdog = 3
+                except Exception as e:
+                    print(f"got {e}")
+
                 await asyncio.sleep(args.batt_rate)
                 watchdog += 1
                 if watchdog > 3:
+                    print("Watchdog")
                     break
 
             print("client disconnect")
-
+            return
     except:
         pass
 
+
+async def get_batt_data(client):
+    batt_info = await client.read_gatt_char(OPENWIND_BAT_CHARACTERISTIC_UUID)
+    bat_data(batt_info)
 
 async def scanner():
     global args
